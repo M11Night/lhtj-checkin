@@ -1,0 +1,30 @@
+name: 龙湖天街每日签到
+
+on:
+  schedule:
+    # 每天 08:30 北京时间 (UTC 00:30)
+    - cron: '30 0 * * *'
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install requests
+
+      - name: 执行签到
+        env:
+          LHTJ_TOKEN: ${{ secrets.LHTJ_TOKEN }}
+          LHTJ_USERTOKEN: ${{ secrets.LHTJ_USERTOKEN }}
+          LHTJ_DXRISK_TOKEN: ${{ secrets.LHTJ_DXRISK_TOKEN }}
+          LHTJ_COOKIE: ${{ secrets.LHTJ_COOKIE }}
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+        run: python checkin.py
