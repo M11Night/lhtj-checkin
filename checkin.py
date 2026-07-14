@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-龙湖天街自动签到 — GitHub Actions 版
-从环境变量读取 Token，签到后推送企业微信通知
+龙湖天街自动签到 — GitHub Actions 版（健壮版 v2）
+改进点：
+  1. 修复 Token 过期检测被异常吞掉的 Bug
+  2. 签到失败自动重试 3 次
+  3. 签到前后成长值对比，验证积分真实到账
+  4. 签到失败时 exit(1)，让 Actions 显示红色 + 触发告警 Issue
+  5. 已签到时静默退出，避免多时段 cron 重复推送
+  6. 移除无意义的 asyncio（原为同步 requests 伪装 async）
 """
 
 import os
 import sys
-import json
 import random
-import asyncio
+import time
 import logging
 import requests
 from datetime import datetime
@@ -31,98 +36,121 @@ def double_log(msg):
     notify_msg.append(msg)
 
 
-async def fetch(url, headers, method='POST', data=None, timeout=10):
-    try:
-        headers = {k.lower(): v for k, v in headers.items()}
-        if method.upper() == 'POST':
-            resp = requests.post(url, headers=headers, json=data, timeout=timeout)
-        else:
-            resp = requests.get(url, headers=headers, params=data, timeout=timeout)
-        resp.raise_for_status()
-        res = resp.json()
-        if 'message' in res and ('登录已过期' in res['message'] or '用户未登录' in res['message']):
-            raise Exception("Token已过期，请更新Secrets")
-        return res
-    except Exception as e:
-        logger.error(f"请求失败: {e}")
-        return {}
+class TokenExpiredError(Exception):
+    """Token 过期异常 — 不被重试吞掉"""
+    pass
 
 
-async def signin(token, usertoken, dxrisk_token, cookie):
-    """每日签到"""
-    try:
-        url = f"{BASE_URL}/lmarketing-task-api-mvc-prod/openapi/task/v1/signature/clock"
-        headers = {
-            'User-Agent': random.choice(USER_AGENTS),
-            'Origin': 'https://longzhu.longfor.com',
-            'Referer': 'https://longzhu.longfor.com/',
-            'X-LF-DXRisk-Source': '5',
-            'X-LF-Bu-Code': 'C20400',
-            'X-GAIA-API-KEY': 'c06753f1-3e68-437d-b592-b94656ea5517',
-            'X-LF-UserToken': usertoken,
-            'X-LF-Channel': 'C2',
-            'X-LF-DXRisk-Token': dxrisk_token,
-            'token': token,
-            'Cookie': cookie,
-            'Content-Type': 'application/json;charset=UTF-8'
-        }
-        data = {"activity_no": "11111111111686241863606037740000"}
-        res = await fetch(url, headers, 'POST', data)
-        is_popup = res.get('data', {}).get('is_popup', 0)
-        reward_num = res.get('data', {}).get('reward_info', [{}])[0].get('reward_num', 0) if is_popup == 1 else 0
-        if is_popup == 1:
-            double_log(f"✅ 每日签到: 成功, 获得{reward_num}分")
-        else:
-            double_log("⛔️ 每日签到: 今日已签到")
-        return reward_num
-    except Exception as e:
-        double_log(f"⛔️ 每日签到失败: {e}")
-        return 0
+def http_request(url, headers, method='POST', data=None, timeout=15, retries=2):
+    """带重试的 HTTP 请求。Token 过期时直接抛出 TokenExpiredError"""
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            hdrs = {k.lower(): v for k, v in headers.items()}
+            if method.upper() == 'POST':
+                resp = requests.post(url, headers=hdrs, json=data, timeout=timeout)
+            else:
+                resp = requests.get(url, headers=hdrs, params=data, timeout=timeout)
+            resp.raise_for_status()
+            res = resp.json()
+            # Token 过期检测 —— 抛出专用异常，不被下方 except 吞掉
+            msg = res.get('message', '')
+            if msg and ('登录已过期' in msg or '用户未登录' in msg):
+                raise TokenExpiredError(f"Token已过期：{msg}")
+            return res
+        except TokenExpiredError:
+            raise  # 直接上抛，不重试
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                wait = random.uniform(3, 8)
+                logger.warning(f"请求失败(第{attempt+1}次)，{wait:.1f}s后重试: {e}")
+                time.sleep(wait)
+    logger.error(f"请求彻底失败(共{retries+1}次): {last_err}")
+    return {}
 
 
-async def get_user_info(token):
+def signin(token, usertoken, dxrisk_token, cookie):
+    """
+    每日签到（带 3 次重试）
+    返回状态: 'new'(首次签到成功) / 'already'(今日已签) / 'failed'(失败)
+    """
+    url = f"{BASE_URL}/lmarketing-task-api-mvc-prod/openapi/task/v1/signature/clock"
+    headers = {
+        'User-Agent': random.choice(USER_AGENTS),
+        'Origin': 'https://longzhu.longfor.com',
+        'Referer': 'https://longzhu.longfor.com/',
+        'X-LF-DXRisk-Source': '5',
+        'X-LF-Bu-Code': 'C20400',
+        'X-GAIA-API-KEY': 'c06753f1-3e68-437d-b592-b94656ea5517',
+        'X-LF-UserToken': usertoken,
+        'X-LF-Channel': 'C2',
+        'X-LF-DXRisk-Token': dxrisk_token,
+        'token': token,
+        'Cookie': cookie,
+        'Content-Type': 'application/json;charset=UTF-8'
+    }
+    data = {"activity_no": "11111111111686241863606037740000"}
+    res = http_request(url, headers, 'POST', data, retries=3)
+
+    if not res:
+        double_log("⛔️ 每日签到: 请求失败（网络/风控），已重试3次仍失败")
+        return 'failed'
+
+    code = res.get('code')
+    data_obj = res.get('data', {})
+    is_popup = data_obj.get('is_popup', 0)
+
+    if code == '0000' and is_popup == 1:
+        reward_num = data_obj.get('reward_info', [{}])[0].get('reward_num', 0)
+        double_log(f"✅ 每日签到: 成功，获得{reward_num}分")
+        return 'new'
+    elif code == '0000' and is_popup == 0:
+        double_log("ℹ️ 每日签到: 今日已签到")
+        return 'already'
+    else:
+        double_log(f"⛔️ 每日签到: 失败 code={code} msg={res.get('message', '未知')}")
+        return 'failed'
+
+
+def get_user_info(token):
     """查询成长值"""
-    try:
-        url = "https://longzhu-api.longfor.com/lmember-member-open-api-prod/api/member/v1/mine-info"
-        headers = {
-            'User-Agent': random.choice(USER_AGENTS),
-            'Referer': 'https://servicewechat.com/wx50282644351869da/424/page-frame.html',
-            'token': token,
-            'X-Gaia-Api-Key': 'd1eb973c-64ec-4dbe-b23b-22c8117c4e8e'
-        }
-        data = {"channel": "C2", "bu_code": "C20400", "token": token}
-        res = await fetch(url, headers, 'POST', data)
-        if res.get('code') == '0000':
-            growth = res['data'].get('growth_value', 0)
-            level = res['data'].get('level', 0)
-            double_log(f"🎉 成长值: {growth}  等级: V{level}")
-            return res['data']
-        return {}
-    except Exception as e:
-        double_log(f"⛔️ 查询成长值失败: {e}")
-        return {}
+    url = "https://longzhu-api.longfor.com/lmember-member-open-api-prod/api/member/v1/mine-info"
+    headers = {
+        'User-Agent': random.choice(USER_AGENTS),
+        'Referer': 'https://servicewechat.com/wx50282644351869da/424/page-frame.html',
+        'token': token,
+        'X-Gaia-Api-Key': 'd1eb973c-64ec-4dbe-b23b-22c8117c4e8e'
+    }
+    data = {"channel": "C2", "bu_code": "C20400", "token": token}
+    res = http_request(url, headers, 'POST', data)
+    if res.get('code') == '0000':
+        growth = res['data'].get('growth_value', 0)
+        level = res['data'].get('level', 0)
+        double_log(f"🎉 成长值: {growth}  等级: V{level}")
+        return res['data']
+    double_log(f"⛔️ 查询成长值失败: {res.get('message', '未知')}")
+    return {}
 
 
-async def get_balance(token):
+def get_balance(token):
     """查询珑珠余额"""
-    try:
-        url = "https://longzhu-api.longfor.com/lmember-member-open-api-prod/api/member/v1/balance"
-        headers = {
-            'User-Agent': random.choice(USER_AGENTS),
-            'Referer': 'https://servicewechat.com/wx50282644351869da/424/page-frame.html',
-            'token': token,
-            'X-Gaia-Api-Key': 'd1eb973c-64ec-4dbe-b23b-22c8117c4e8e'
-        }
-        data = {"channel": "C2", "bu_code": "C20400", "token": token}
-        res = await fetch(url, headers, 'POST', data)
-        if res.get('code') == '0000':
-            balance = res['data'].get('balance', 0)
-            double_log(f"💰 珑珠: {balance}")
-            return res['data']
-        return {}
-    except Exception as e:
-        double_log(f"⛔️ 查询珑珠失败: {e}")
-        return {}
+    url = "https://longzhu-api.longfor.com/lmember-member-open-api-prod/api/member/v1/balance"
+    headers = {
+        'User-Agent': random.choice(USER_AGENTS),
+        'Referer': 'https://servicewechat.com/wx50282644351869da/424/page-frame.html',
+        'token': token,
+        'X-Gaia-Api-Key': 'd1eb973c-64ec-4dbe-b23b-22c8117c4e8e'
+    }
+    data = {"channel": "C2", "bu_code": "C20400", "token": token}
+    res = http_request(url, headers, 'POST', data)
+    if res.get('code') == '0000':
+        balance = res['data'].get('balance', 0)
+        expiring = res['data'].get('expiring_lz', 0)
+        double_log(f"💰 珑珠: {balance}" + (f"（⚠️即将过期{expiring}）" if expiring else ""))
+        return res['data']
+    double_log(f"⛔️ 查询珑珠失败: {res.get('message', '未知')}")
+    return {}
 
 
 def push_wecom(content):
@@ -145,8 +173,7 @@ def push_wecom(content):
         logger.error(f"⛔️ 推送异常: {e}")
 
 
-async def main():
-    # 从环境变量读取配置
+def main():
     token = os.getenv('LHTJ_TOKEN', '')
     usertoken = os.getenv('LHTJ_USERTOKEN', '')
     dxrisk_token = os.getenv('LHTJ_DXRISK_TOKEN', '')
@@ -157,21 +184,67 @@ async def main():
         sys.exit(1)
 
     logger.info("🚀 龙湖天街签到开始")
+    double_log(f"⏰ 执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # 签到
-    await signin(token, usertoken, dxrisk_token, cookie)
+    token_expired = False
+    signin_status = 'failed'
 
-    # 查询
-    await get_user_info(token)
-    await get_balance(token)
+    try:
+        # 签到前查一次成长值（基准）
+        before = get_user_info(token)
+        growth_before = before.get('growth_value', 0)
+
+        # 签到
+        signin_status = signin(token, usertoken, dxrisk_token, cookie)
+
+        # 今日已签到 → 静默退出，不推送（避免多时段 cron 重复打扰）
+        if signin_status == 'already':
+            logger.info("今日已签到，静默退出，不推送")
+            sys.exit(0)
+
+        # 首次签到成功 → 签到后查成长值，验证积分到账
+        if signin_status == 'new':
+            time.sleep(2)
+            after = get_user_info(token)
+            growth_after = after.get('growth_value', 0)
+            if growth_before and growth_after:
+                diff = growth_after - growth_before
+                if diff > 0:
+                    double_log(f"📈 签到验证: 成长值 {growth_before} → {growth_after}（+{diff}）✅积分已到账")
+                else:
+                    double_log(f"⚠️ 签到验证: 成长值未变化({growth_before}→{growth_after})，积分可能延迟到账")
+
+        # 珑珠余额
+        get_balance(token)
+
+    except TokenExpiredError as e:
+        double_log(f"🚨 {e}")
+        token_expired = True
+        signin_status = 'failed'
+    except Exception as e:
+        double_log(f"🚨 签到流程异常: {e}")
+        signin_status = 'failed'
 
     # 推送
     today = datetime.now().strftime('%Y-%m-%d')
-    content = f"## 龙湖天街签到报告\n---\n📅 {today}\n\n" + "\n".join(notify_msg)
+    if signin_status == 'new':
+        status_emoji = "✅"
+        title = f"{status_emoji} 龙湖天街签到成功"
+    else:
+        status_emoji = "🚨"
+        title = f"{status_emoji} 龙湖天街签到失败"
+
+    content = f"## {title}\n---\n📅 {today}\n\n" + "\n".join(notify_msg)
+    if token_expired:
+        content += "\n\n⚠️ **Token已过期，请尽快更新 GitHub Secrets！**"
     push_wecom(content)
 
-    logger.info("✅ 签到任务完成")
+    logger.info("签到任务结束")
+    # 签到失败时退出码 1，让 Actions 显示红色 + 触发告警 Issue
+    if signin_status == 'failed':
+        logger.error("签到未成功，退出码 1")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

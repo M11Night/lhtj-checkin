@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# 含明文 Token 的文档，禁止提交
+部署教程.md
+龙湖天街签到项目审核报告.md
+
+# 本地配置
+*.json
+*.txt

@@ -2,15 +2,26 @@ name: 龙湖天街每日签到
 
 on:
   schedule:
-    # 每天 08:30 北京时间 (UTC 00:30)
-    - cron: '30 0 * * *'
+    # 多时段策略：08:30 主签到，14:00 兜底重试
+    # GitHub Actions cron 有延迟/跳过风险，双时段确保不漏签
+    # 脚本会自动判断"今日已签到"并静默退出，不会重复推送
+    - cron: '30 0 * * *'   # 北京 08:30（主）
+    - cron: '0 6 * * *'    # 北京 14:00（兜底）
   workflow_dispatch: # 允许手动触发
+
+# 同一时间只允许一个签到任务运行，避免并发冲突
+concurrency:
+  group: checkin
+  cancel-in-progress: false
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # 最小权限原则
     steps:
-      - uses: actions/checkout@v4
+      - name: 检出代码
+        uses: actions/checkout@v4
 
       - name: 设置 Python
         uses: actions/setup-python@v5
@@ -28,3 +39,46 @@ jobs:
           LHTJ_COOKIE: ${{ secrets.LHTJ_COOKIE }}
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
         run: python checkin.py
+
+  # 签到失败时自动创建 Issue 告警（红色 ✗ 才触发）
+  alert:
+    needs: checkin
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: 创建告警 Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const date = new Date().toISOString().slice(0, 10);
+            // 查找是否已有同日告警 Issue，避免重复
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: '签到告警',
+              state: 'open'
+            });
+            const exists = issues.data.find(i => i.title.includes(date));
+            if (exists) {
+              console.log(`今日告警 Issue 已存在: ${exists.html_url}`);
+              return;
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 签到失败告警 - ${date}`,
+              body: [
+                '签到任务执行失败，可能原因：',
+                '',
+                '1. **Token 过期** — 重新抓包更新 Secrets（最常见）',
+                '2. **风控触发** — 手动进小程序签到一次过滑块',
+                '3. **网络异常** — 通常会自动重试，连续失败才告警',
+                '',
+                '👉 [查看运行日志](https://github.com/' + context.repo.owner + '/' + context.repo.repo + '/actions)',
+                '',
+                '修复后请关闭此 Issue。'
+              ].join('\n'),
+              labels: ['签到告警']
+            });
