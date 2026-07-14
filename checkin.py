@@ -91,7 +91,7 @@ def signin(token, usertoken, dxrisk_token, cookie):
         'Cookie': cookie,
         'Content-Type': 'application/json;charset=UTF-8'
     }
-    activity_no = os.getenv('LHTJ_ACTIVITY_NO', '11111111111686241863606037740000')
+    activity_no = os.getenv('LHTJ_ACTIVITY_NO', '') or '11111111111686241863606037740000'
     data = {"activity_no": activity_no}
     res = http_request(url, headers, 'POST', data, retries=3)
 
