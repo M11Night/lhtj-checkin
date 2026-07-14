@@ -39,6 +39,7 @@ jobs:
           LHTJ_COOKIE: ${{ secrets.LHTJ_COOKIE }}
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
           LHTJ_ACTIVITY_NO: ${{ secrets.LHTJ_ACTIVITY_NO }} # 可选，不配置则用默认活动号
+          LHTJ_CAPTCHA_TOKEN: ${{ secrets.LHTJ_CAPTCHA_TOKEN }} # 可选，过滑块验证后才需要
         run: python checkin.py
 
   # 签到失败时自动创建 Issue 告警（红色 ✗ 才触发）

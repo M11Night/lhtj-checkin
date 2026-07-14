@@ -86,6 +86,7 @@ def signin(token, usertoken, dxrisk_token, cookie):
         'X-LF-UserToken': usertoken,
         'X-LF-Channel': 'C2',
         'X-LF-DXRisk-Token': dxrisk_token,
+        'X-LF-DXRisk-Captcha-Token': os.getenv('LHTJ_CAPTCHA_TOKEN', ''), # 过滑块后才有，可选
         'token': token,
         'Cookie': cookie,
         'Content-Type': 'application/json;charset=UTF-8'
