@@ -90,7 +90,8 @@ def signin(token, usertoken, dxrisk_token, cookie):
         'Cookie': cookie,
         'Content-Type': 'application/json;charset=UTF-8'
     }
-    data = {"activity_no": "11111111111686241863606037740000"}
+    activity_no = os.getenv('LHTJ_ACTIVITY_NO', '11111111111686241863606037740000')
+    data = {"activity_no": activity_no}
     res = http_request(url, headers, 'POST', data, retries=3)
 
     if not res:
@@ -109,7 +110,12 @@ def signin(token, usertoken, dxrisk_token, cookie):
         double_log("ℹ️ 每日签到: 今日已签到")
         return 'already'
     else:
-        double_log(f"⛔️ 每日签到: 失败 code={code} msg={res.get('message', '未知')}")
+        if code == '801810':
+            double_log(f"⛔️ 每日签到: 活动不可用 code=801810「{res.get('message', '')}」")
+            double_log("⚠️ 可能: activity_no过期 或 风控触发")
+            double_log("📋 处理: 手动进小程序签到确认 → 重新抓包更新 LHTJ_ACTIVITY_NO 和 LHTJ_DXRISK_TOKEN")
+        else:
+            double_log(f"⛔️ 每日签到: 失败 code={code} msg={res.get('message', '未知')}")
         return 'failed'
 
 

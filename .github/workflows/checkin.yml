@@ -38,6 +38,7 @@ jobs:
           LHTJ_DXRISK_TOKEN: ${{ secrets.LHTJ_DXRISK_TOKEN }}
           LHTJ_COOKIE: ${{ secrets.LHTJ_COOKIE }}
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          LHTJ_ACTIVITY_NO: ${{ secrets.LHTJ_ACTIVITY_NO }} # 可选，不配置则用默认活动号
         run: python checkin.py
 
   # 签到失败时自动创建 Issue 告警（红色 ✗ 才触发）
@@ -73,8 +74,9 @@ jobs:
                 '签到任务执行失败，可能原因：',
                 '',
                 '1. **Token 过期** — 重新抓包更新 Secrets（最常见）',
-                '2. **风控触发** — 手动进小程序签到一次过滑块',
-                '3. **网络异常** — 通常会自动重试，连续失败才告警',
+                '2. **activity_no 过期** — 重新抓包获取新签到活动号，更新 LHTJ_ACTIVITY_NO',
+                '3. **风控触发** — 手动进小程序签到一次过滑块',
+                '4. **网络异常** — 通常会自动重试，连续失败才告警',
                 '',
                 '👉 [查看运行日志](https://github.com/' + context.repo.owner + '/' + context.repo.repo + '/actions)',
                 '',
