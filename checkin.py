@@ -112,11 +112,17 @@ def signin(token, usertoken, dxrisk_token, cookie):
         return 'already'
     else:
         if code == '801810':
-            double_log(f"⛔️ 每日签到: 活动不可用 code=801810「{res.get('message', '')}」")
-            double_log("⚠️ 可能: activity_no过期 或 风控触发")
-            double_log("📋 处理: 手动进小程序签到确认 → 重新抓包更新 LHTJ_ACTIVITY_NO 和 LHTJ_DXRISK_TOKEN")
+            double_log(f"⛔️ 每日签到: 风控拦截 code=801810「{res.get('message', '')}」")
+            double_log("📋 多为 captcha-token 过期(约3天一次)。处理：")
+            double_log("   1) 微信小程序签到→抓包 3 个值(Captcha-Token/DXRisk-Token/Cookie)")
+            double_log("   2) 运行 ./refresh.sh \"<值1>\" \"<值2>\" \"<值3>\" 一键刷新")
+        elif code in ('8040012', '801900'):
+            double_log(f"⛔️ 每日签到: code={code}「{res.get('message', '')}」")
+            double_log("📋 captcha-token 失效或参数错误。抓包更新后运行 ./refresh.sh")
         else:
             double_log(f"⛔️ 每日签到: 失败 code={code} msg={res.get('message', '未知')}")
+            if '登录' in res.get('message', '') or '过期' in res.get('message', ''):
+                double_log("📋 主 Token 过期，需重新抓包更新 LHTJ_TOKEN / LHTJ_USERTOKEN")
         return 'failed'
 
 
