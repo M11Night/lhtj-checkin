@@ -1,0 +1,103 @@
+name: 龙湖天街签到-Playwright兜底
+
+# ============================================================
+# 两方案并存策略：API 方案（checkin.yml）做主力，本方案做兜底。
+# 触发方式：
+#   1. workflow_dispatch —— checkin.yml 签到失败时通过 gh workflow run 触发
+#   2. workflow_dispatch 手动触发
+# 职责：浏览器完整签到 + 过顶象验证码 + 刷新 captcha-token 写回 Secrets
+# ============================================================
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: '触发原因（API失败/手动）'
+        required: false
+        default: 'manual'
+
+# 与 API 方案共用 concurrency 组，避免兜底与重试并发冲突
+concurrency:
+  group: checkin
+  cancel-in-progress: false
+
+jobs:
+  playwright-checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      actions: write   # 需要 actions:write 来用 gh workflow run / 写 secret
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装 Python 依赖
+        run: |
+          pip install playwright requests opencv-python-headless numpy
+          playwright install chromium --with-deps
+
+      - name: 执行 Playwright 兜底签到
+        env:
+          LHTJ_TOKEN: ${{ secrets.LHTJ_TOKEN }}
+          LHTJ_USERTOKEN: ${{ secrets.LHTJ_USERTOKEN }}
+          LHTJ_DXRISK_TOKEN: ${{ secrets.LHTJ_DXRISK_TOKEN }}
+          LHTJ_COOKIE: ${{ secrets.LHTJ_COOKIE }}
+          LHTJ_ACTIVITY_NO: ${{ secrets.LHTJ_ACTIVITY_NO }}
+          LHTJ_CAPTCHA_TOKEN: ${{ secrets.LHTJ_CAPTCHA_TOKEN }}
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}          # 写回 Secret 需要具有 repo 权限的 PAT
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python checkin_playwright.py
+
+      - name: 上传调试截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-screenshots
+          path: /tmp/pw_*.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # 兜底也失败时创建告警 Issue
+  alert:
+    needs: playwright-checkin
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: 创建告警 Issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const date = new Date().toISOString().slice(0, 10);
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              labels: '签到告警', state: 'open'
+            });
+            const exists = issues.data.find(i => i.title.includes(date) && i.title.includes('Playwright'));
+            if (exists) { console.log('今日 Playwright 告警已存在'); return; }
+            await github.rest.issues.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title: `🚨 Playwright 兜底也失败 - ${date}`,
+              body: [
+                '## ⚠️ API 签到失败，Playwright 兜底也失败',
+                '',
+                '说明：API 方案和 Playwright 浏览器兜底都没能完成签到。',
+                '',
+                '可能原因：',
+                '1. **长效 Token (LHTJ_TOKEN) 过期** —— 重新抓包更新（最常见）',
+                '2. **顶象滑块识别失败** —— 查看截图 artifacts，人工过一次滑块',
+                '3. **Cookie 失效** —— 重新抓包更新 LHTJ_COOKIE',
+                '',
+                '👉 [查看运行日志与截图](https://github.com/' + context.repo.owner + '/' + context.repo.repo + '/actions)',
+                '',
+                '修复后请关闭此 Issue。'
+              ].join('\n'),
+              labels: ['签到告警']
+            });

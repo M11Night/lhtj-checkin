@@ -42,6 +42,29 @@ jobs:
           LHTJ_CAPTCHA_TOKEN: ${{ secrets.LHTJ_CAPTCHA_TOKEN }} # 可选，过滑块验证后才需要
         run: python checkin.py
 
+  # 签到失败 → 触发 Playwright 兜底方案（两方案并存策略）
+  trigger-fallback:
+    needs: checkin
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: 触发 Playwright 兜底工作流
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "⚠️ 未配置 GH_PAT Secret，无法自动触发 Playwright 兜底"
+            echo "请创建 Personal Access Token (repo + workflow 权限) 并存为 GH_PAT Secret"
+            exit 0
+          fi
+          echo "🤖 API 签到失败，触发 Playwright 兜底..."
+          gh workflow run playwright.yml \
+            -R "${{ github.repository }}" \
+            -f reason="API签到失败自动触发"
+          echo "✅ 已触发 Playwright 兜底工作流"
+
   # 签到失败时自动创建 Issue 告警（红色 ✗ 才触发）
   alert:
     needs: checkin
@@ -78,6 +101,8 @@ jobs:
                 '2. **activity_no 过期** — 重新抓包获取新签到活动号，更新 LHTJ_ACTIVITY_NO',
                 '3. **风控触发** — 手动进小程序签到一次过滑块',
                 '4. **网络异常** — 通常会自动重试，连续失败才告警',
+                '',
+                '🤖 **Playwright 兜底方案已自动触发**（如已配置 GH_PAT），稍后查看运行结果。',
                 '',
                 '👉 [查看运行日志](https://github.com/' + context.repo.owner + '/' + context.repo.repo + '/actions)',
                 '',
