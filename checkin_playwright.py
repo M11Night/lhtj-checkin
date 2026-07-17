@@ -419,32 +419,48 @@ def run():
 
 def do_signin(page):
     """核心签到流程。返回 'new'/'already'/'token_only'/'failed'"""
-    # 1. 打开首页，注入 token 到 sessionStorage
-    log("→ 打开首页并注入 Token...")
-    page.goto(HOME_URL, wait_until='networkidle', timeout=30000)
-    page.evaluate('(t) => { sessionStorage.setItem("token", t); }', LHTJ_TOKEN)
-    page.evaluate('''() => {
-        sessionStorage.setItem("buCode", "C50701");
-        sessionStorage.setItem("channel", "C5");
-        sessionStorage.setItem("cityCode", "440300");
-    }''')
-
-    # 2. 跳转签到页（带 token 参数）
-    log("→ 跳转签到页...")
-    page.goto(SIGNIN_URL.format(token=LHTJ_TOKEN), wait_until='networkidle', timeout=30000)
-    time.sleep(2)
-    page.screenshot(path='/tmp/pw_signin_page.png', full_page=True)
-
-    body_text = page.inner_text('body')
-    # 检测登录态
-    if '登录已过期' in body_text or '请重新登录' in body_text:
-        log("⛔️ Token 无效（H5 判定登录已过期）。长效 Token 也过期了，需重新抓包更新 LHTJ_TOKEN")
-        # 点"知道了"关闭弹窗看看
-        try:
-            page.locator('text=知道了').first.click(timeout=2000)
-        except Exception:
-            pass
+    # H5 认证：x-lf-usertoken 头 ← sessionStorage "token"。
+    # 实测 H5 web token 对应 LHTJ_USERTOKEN（与 API 的 LHTJ_TOKEN 是两个不同凭证）。
+    # 优先用 LHTJ_USERTOKEN，失败则退回 LHTJ_TOKEN 尝试。
+    h5_tokens = [t for t in [LHTJ_USERTOKEN, LHTJ_TOKEN] if t]
+    if not h5_tokens:
+        log("⛔️ 无可用 Token（LHTJ_USERTOKEN / LHTJ_TOKEN 均为空）")
         return 'failed'
+
+    for idx, h5_token in enumerate(h5_tokens):
+        which = 'LHTJ_USERTOKEN' if idx == 0 and LHTJ_USERTOKEN else 'LHTJ_TOKEN'
+        log(f"→ 打开首页并注入 Token（尝试 {which}）...")
+        page.goto(HOME_URL, wait_until='networkidle', timeout=30000)
+        page.evaluate('(t) => { sessionStorage.setItem("token", t); }', h5_token)
+        page.evaluate('''() => {
+            sessionStorage.setItem("buCode", "C50701");
+            sessionStorage.setItem("channel", "C5");
+            sessionStorage.setItem("cityCode", "440300");
+        }''')
+
+        # 2. 跳转签到页（带 token 参数）
+        log("→ 跳转签到页...")
+        page.goto(SIGNIN_URL.format(token=h5_token), wait_until='networkidle', timeout=30000)
+        time.sleep(2)
+        page.screenshot(path='/tmp/pw_signin_page.png', full_page=True)
+
+        body_text = page.inner_text('body')
+        # 检测登录态
+        if '登录已过期' in body_text or '请重新登录' in body_text:
+            log(f"⚠️ {which} 无效（H5 判定登录已过期）")
+            # 点"知道了"关闭弹窗
+            try:
+                page.locator('text=知道了').first.click(timeout=2000)
+            except Exception:
+                pass
+            if idx < len(h5_tokens) - 1:
+                log("→ 换下一个 Token 重试...")
+                continue
+            log("⛔️ 两个 Token 均无法通过 H5 认证。长效 Token 可能已过期，需重新抓包")
+            return 'failed'
+        # 认证通过，继续签到
+        log(f"✅ {which} 认证通过")
+        break
 
     # 检测今日已签到
     if '今日已签到' in body_text or '已签到' in body_text:
