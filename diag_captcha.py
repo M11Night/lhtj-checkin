@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""临时诊断脚本 v2：隔离 8040012「网络故障」的触发因素（cookie/dxrisk/UA）"""
+"""临时诊断脚本 v3：验证「先访问域名获取绑定当前IP的 acw_tc，再调 signature/clock」是否可行"""
 import os
 import json
 import requests
 
 BASE = "https://gw2c-hw-open.longfor.com/lmarketing-task-api-mvc-prod/openapi/task/v1/signature/clock"
-MINE = "https://longzhu-api.longfor.com/lmember-member-open-api-prod/api/member/v1/mine-info"
 token = os.getenv('LHTJ_TOKEN', '')
 usertoken = os.getenv('LHTJ_USERTOKEN', '') or token
 dxrisk = os.getenv('LHTJ_DXRISK_TOKEN', '')
@@ -14,13 +13,11 @@ cap = os.getenv('LHTJ_CAPTCHA_TOKEN', '')
 UA_MINI = ("Mozilla/5.0 (iPhone; CPU iPhone OS 27_0 like Mac OS X) AppleWebKit/605.1.15 "
            "(KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.75(0x18004b64) "
            "NetType/WIFI Language/zh_CN miniProgram/wx50282644351869da")
-UA_ANDROID = ("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) "
-              "Chrome/124.0.0.0 Mobile Safari/537.36")
 
 
-def clock(name, ua=UA_MINI, use_cookie=True, use_dxrisk=True, cap_header=None):
-    headers = {
-        'User-Agent': ua,
+def base_headers(cap_header):
+    h = {
+        'User-Agent': UA_MINI,
         'Accept': 'application/json, text/plain, */*',
         'Content-Type': 'application/json;charset=UTF-8',
         'X-LF-DXRisk-Source': '5',
@@ -28,45 +25,62 @@ def clock(name, ua=UA_MINI, use_cookie=True, use_dxrisk=True, cap_header=None):
         'X-GAIA-API-KEY': 'c06753f1-3e68-437d-b592-b94656ea5517',
         'X-LF-UserToken': usertoken,
         'X-LF-Channel': 'C2',
+        'X-LF-DXRisk-Token': dxrisk,
+        'X-LF-DXRisk-Captcha-Token': cap_header,
         'token': token,
         'Origin': 'https://longzhu.longfor.com',
         'Referer': 'https://longzhu.longfor.com/',
     }
-    if use_dxrisk:
-        headers['X-LF-DXRisk-Token'] = dxrisk
-    headers['X-LF-DXRisk-Captcha-Token'] = cap_header if cap_header is not None else cap
-    if use_cookie:
-        headers['Cookie'] = cookie
-    data = {"activity_no": os.getenv('LHTJ_ACTIVITY_NO', '') or '11111111111686241863606037740000'}
+    return h
+
+
+DATA = {"activity_no": os.getenv('LHTJ_ACTIVITY_NO', '') or '11111111111686241863606037740000'}
+
+
+def show(name, resp):
     try:
-        r = requests.post(BASE, headers=headers, json=data, timeout=15)
-        body = r.json() if r.headers.get('content-type', '').startswith('application/json') else r.text[:200]
-        print(f"== {name} == HTTP {r.status_code} -> {json.dumps(body, ensure_ascii=False)[:300]}")
-    except Exception as e:
-        print(f"== {name} == ERROR {e}")
+        body = resp.json()
+        print(f"== {name} == HTTP {resp.status_code} -> {json.dumps(body, ensure_ascii=False)[:300]}")
+    except Exception:
+        print(f"== {name} == HTTP {resp.status_code} -> {resp.text[:200]}")
 
 
-def mine():
-    headers = {
-        'User-Agent': UA_MINI,
-        'Referer': 'https://servicewechat.com/wx50282644351869da/424/page-frame.html',
-        'token': token,
-        'X-Gaia-Api-Key': 'd1eb973c-64ec-4dbe-b23b-22c8117c4e8e',
-        'Content-Type': 'application/json',
-    }
-    data = {"channel": "C2", "bu_code": "C20400", "token": token}
+# 0. 连通性：直接 GET gw2c 主机
+try:
+    r0 = requests.get("https://gw2c-hw-open.longfor.com/", headers={'User-Agent': UA_MINI}, timeout=10)
+    print(f"== 0 连通性 GET gw2c == HTTP {r0.status_code} Set-Cookie头: {r0.headers.get('Set-Cookie','')[:120]}")
+except Exception as e:
+    print(f"== 0 连通性 GET gw2c == ERROR {e}")
+
+# 1. 用手机抓的 cookie（基线）
+try:
+    h = base_headers(cap)
+    h['Cookie'] = cookie
+    r1 = requests.post(BASE, headers=h, json=DATA, timeout=15)
+    show("1 手机cookie(基线)", r1)
+except Exception as e:
+    print(f"== 1 手机cookie == ERROR {e}")
+
+# 2. 新建 Session，先访问两个域名拿绑定本IP的新 acw_tc，再调接口
+s2 = requests.Session()
+s2.headers.update({'User-Agent': UA_MINI})
+for u in ['https://longzhu.longfor.com/', 'https://gw2c-hw-open.longfor.com/']:
     try:
-        r = requests.post(MINE, headers=headers, json=data, timeout=15)
-        print(f"== mine-info == HTTP {r.status_code} -> {r.text[:300]}")
-    except Exception as e:
-        print(f"== mine-info == ERROR {e}")
+        s2.get(u, timeout=10)
+    except Exception:
+        pass
+print(f"== 2 新Session的cookies == {list(s2.cookies.items())}")
+try:
+    h2 = base_headers(cap)
+    r2 = s2.post(BASE, headers=h2, json=DATA, timeout=15)
+    show("2 新acw_tc+有效cap", r2)
+except Exception as e:
+    print(f"== 2 新acw_tc == ERROR {e}")
 
-
-mine()
-clock("1 基线(全部头)", cap_header=cap)
-clock("2 无cookie", use_cookie=False)
-clock("3 无dxrisk", use_dxrisk=False)
-clock("4 AndroidUA+cookie", ua=UA_ANDROID)
-clock("5 空cap+无cookie+无dxrisk", use_cookie=False, use_dxrisk=False, cap_header='')
-clock("6 假cap+无cookie+无dxrisk", use_cookie=False, use_dxrisk=False,
-      cap_header='deadbeefdeadbeefdeadbeefdeadbeefdeadbeef:' + dxrisk)
+# 3. 新Session + 空cap
+try:
+    h3 = base_headers('')
+    r3 = s2.post(BASE, headers=h3, json=DATA, timeout=15)
+    show("3 新acw_tc+空cap", r3)
+except Exception as e:
+    print(f"== 3 新acw_tc+空cap == ERROR {e}")
