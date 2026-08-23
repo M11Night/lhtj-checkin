@@ -56,7 +56,7 @@ DEVICE_SCALE_FACTOR = 2
 HOME_URL = 'https://longzhu.longfor.com/'
 # 签到页：token 通过 URL 参数 + sessionStorage 传递
 SIGNIN_URL = ('https://longzhu.longfor.com/#/signin?token={token}'
-              '&buCode=C50701&channel=C5&cityCode=440300&task_id=null'
+              '&buCode=C20400&channel=C2&cityCode=440300&task_id=null'
               '&navFontColor=323232&navBgColor=f7dda9&title=%E6%89%93%E5%8D%A1%E7%AD%BE%E5%88%B0&navTitle=')
 
 # 成长值查询（与 API 方案一致，用于验证签到到账）
@@ -556,8 +556,8 @@ def do_signin(page):
         page.goto(HOME_URL, wait_until='networkidle', timeout=30000)
         page.evaluate('(t) => { sessionStorage.setItem("token", t); }', h5_token)
         page.evaluate('''() => {
-            sessionStorage.setItem("buCode", "C50701");
-            sessionStorage.setItem("channel", "C5");
+            sessionStorage.setItem("buCode", "C20400");
+            sessionStorage.setItem("channel", "C2");
             sessionStorage.setItem("cityCode", "440300");
         }''')
 
