@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""顶象 SDK 实验：在 GitHub Actions 里直接实例化验证码，抓 validate token 与 dxrisk"""
+"""顶象 SDK v2：GitHub Actions 里完整跑验证码，抓 validate token"""
 import os
 import time
 import json
@@ -7,7 +7,16 @@ from playwright.sync_api import sync_playwright
 
 TOKEN = os.getenv('LHTJ_TOKEN', '')
 COOKIE = os.getenv('LHTJ_COOKIE', '')
-APPID = 'd1a43734fc59aeae9f1562dbd70fdf54'
+CONFIG = {
+    'appId': 'd1a43734fc59aeae9f1562dbd70fdf54',
+    'constIDServer': 'https://ly-sta.longhu.net/udid/c1',
+    'constID_js': 'https://s.longfor.com/dx-captcha/libs/const-id.js',
+    'ua_js': 'https://s.longfor.com/dx-captcha/libs/greenseer.js',
+    'apiServer': 'https://ly-ver.longhu.net',
+    'isSaaS': False,
+    'serverlessBgSrc': 'https://ly-sta.longhu.net',
+    'style': 'popup', 'width': 300, 'height': 150, 'originWidth': 300,
+}
 UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 27_0 like Mac OS X) AppleWebKit/605.1.15 "
       "(KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.75(0x18004b64) "
       "NetType/WIFI Language/zh_CN miniProgram/wx50282644351869da")
@@ -17,6 +26,23 @@ Object.defineProperty(navigator, 'platform', {get: () => 'iPhone'});
 Object.defineProperty(navigator, 'vendor', {get: () => 'Apple Computer, Inc.'});
 Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 6});
 Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 5});
+"""
+HOOK = r"""
+window.__net = [];
+(function() {
+    const oOpen = XMLHttpRequest.prototype.open, oSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(m, u) { this.__u = String(u); return oOpen.apply(this, arguments); };
+    XMLHttpRequest.prototype.send = function() {
+        const self = this;
+        this.addEventListener('load', function() {
+            if (/longhu\.net|dingxiang/.test(self.__u)) {
+                const t = self.responseText || '';
+                window.__net.push(['XHR', self.__u.slice(0, 160), t.slice(0, 900)]);
+            }
+        });
+        return oSend.apply(this, arguments);
+    };
+})();
 """
 
 with sync_playwright() as p:
@@ -35,61 +61,49 @@ with sync_playwright() as p:
                 except Exception:
                     pass
     ctx.add_init_script(STEALTH)
+    ctx.add_init_script(HOOK)
     page = ctx.new_page()
-    net = []
-    page.on('request', lambda r: net.append(('REQ', r.url[:180])) if any(
-        k in r.url for k in ('cap.dingxiang', 'constid', 'eventreport', 'ly-ver')) else None)
-    page.on('response', lambda r: net.append(('RESP', r.status, r.url[:150])) if any(
-        k in r.url for k in ('cap.dingxiang', 'constid', 'eventreport', 'ly-ver')) else None)
-
     page.goto('https://longzhu.longfor.com/', wait_until='networkidle', timeout=40000)
     time.sleep(2)
 
-    result = page.evaluate('''(appid) => {
-        const el = document.createElement('div'); el.id = 'capbox';
-        document.body.appendChild(el);
+    has_dx = page.evaluate('typeof window._dx')
+    print('=== _dx exists:', has_dx, '===')
+
+    page.evaluate('''(config) => {
+        const el = document.createElement('div'); el.id = 'capbox'; document.body.appendChild(el);
         window.__events = [];
-        const c = new window._dx.Captcha(el, {appId: appid, width: 300, height: 150, originWidth: 300});
-        window.__c = c;
-        for (const ev of ['ready','success','fail','error','close','verify','loaded','show','pass','refresh']) {
+        const c = new window._dx.Captcha(el, config); window.__c = c;
+        for (const ev of ['ready','success','fail','error','verifySuccess','passByServer',
+                          'verifyDone','verify','show','hide','dragEnd','loadFail']) {
             try { c.on(ev, (...args) => window.__events.push([ev, args.map(a => typeof a === 'object'
                 ? JSON.stringify(a).slice(0, 500) : String(a).slice(0, 500))])); } catch (e) {}
         }
         c.show();
-        return 'shown';
-    }''', APPID)
+    }''', CONFIG)
 
-    # 等最多 40 秒，观察是否出现 success/pass
     final = None
-    for _ in range(40):
-        time.sleep(1)
+    for i in range(24):
+        time.sleep(5)
         final = page.evaluate('''() => ({
+            smart: !!document.querySelector('.dx_captcha_loading_smart_checking'),
+            pass: !!document.querySelector('.dx_captcha_loading_pass_by_server'),
+            success: !!document.querySelector('.dx_captcha_loading_bar-success'),
+            slider: !!document.querySelector('.dx_captcha_loading_pic'),
+            basic: !!document.querySelector('.dx_captcha_basic_wrapper'),
             events: window.__events,
-            passByServer: !!document.querySelector('.dx_captcha_loading_pass_by_server'),
-            barSuccess: !!document.querySelector('.dx_captcha_loading_bar-success'),
-            smartChecking: !!document.querySelector('.dx_captcha_loading_smart_checking'),
-            slider: !!document.querySelector('.dx_captcha_loading_pic')
+            domSnippet: (document.getElementById('capbox')||{}).innerHTML ?
+                document.getElementById('capbox').innerHTML.slice(0, 150) : ''
         })''')
-        if final['events'] and any(e[0] in ('success', 'pass', 'verify') for e in final['events']):
+        print(f'[{i*5}s] smart={final["smart"]} pass={final["pass"]} success={final["success"]} slider={final["slider"]} events={len(final["events"])}')
+        if any(e[0] in ('success', 'verifySuccess', 'passByServer') for e in final['events']):
             break
 
-    # 收集存储里的 constid/dxrisk
-    storage = page.evaluate('''() => {
-        const out = {};
-        for (let i = 0; i < localStorage.length; i++) {
-            const k = localStorage.key(i);
-            if (/dx|const|risk|captcha|udid/i.test(k)) out[k] = String(localStorage.getItem(k)).slice(0, 120);
-        }
-        return out;
-    }''')
-
-    print('=== 最终状态 ===')
-    print(json.dumps(final, indent=1, ensure_ascii=False, default=str)[:4000])
-    print('=== localStorage ===')
-    print(json.dumps(storage, indent=1, ensure_ascii=False)[:2000])
-    print('=== 网络 ===')
-    for x in net[:25]:
-        print(x)
+    print('=== 最终事件 ===')
+    print(json.dumps(final['events'], indent=1, ensure_ascii=False, default=str)[:3000])
+    print('=== 网络(ly-ver) ===')
+    for x in page.evaluate('window.__net'):
+        if 'api/' in x[1]:
+            print(json.dumps(x, ensure_ascii=False)[:800])
     try:
         page.screenshot(path='/tmp/diag_sdk.png')
         print('截图已保存')
