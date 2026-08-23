@@ -1,0 +1,54 @@
+name: 刷新 captcha-token
+on:
+  workflow_dispatch:
+    inputs:
+      captcha_token:
+        description: 'X-LF-DXRisk-Captcha-Token（过滑块后抓包得到，格式 哈希:dxrisk，必填）'
+        required: true
+      dxrisk_token:
+        description: 'X-LF-DXRisk-Token（与 captcha-token 配对，可选）'
+        required: false
+      token:
+        description: 'token / X-LF-UserToken（可选，过期才填，两者同值）'
+        required: false
+      cookie:
+        description: 'Cookie（可选，过期才填）'
+        required: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 更新 LHTJ_CAPTCHA_TOKEN
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          VALUE: ${{ inputs.captcha_token }}
+        run: gh secret set LHTJ_CAPTCHA_TOKEN --repo "$GITHUB_REPOSITORY" --body "$VALUE"
+
+      - name: 更新 LHTJ_DXRISK_TOKEN
+        if: inputs.dxrisk_token != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          VALUE: ${{ inputs.dxrisk_token }}
+        run: gh secret set LHTJ_DXRISK_TOKEN --repo "$GITHUB_REPOSITORY" --body "$VALUE"
+
+      - name: 更新 LHTJ_TOKEN / LHTJ_USERTOKEN
+        if: inputs.token != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          VALUE: ${{ inputs.token }}
+        run: |
+          gh secret set LHTJ_TOKEN --repo "$GITHUB_REPOSITORY" --body "$VALUE"
+          gh secret set LHTJ_USERTOKEN --repo "$GITHUB_REPOSITORY" --body "$VALUE"
+
+      - name: 更新 LHTJ_COOKIE
+        if: inputs.cookie != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          VALUE: ${{ inputs.cookie }}
+        run: gh secret set LHTJ_COOKIE --repo "$GITHUB_REPOSITORY" --body "$VALUE"
+
+      - name: 完成提示
+        run: |
+          echo "✅ captcha-token 已更新，checkin.py 将恢复自动签到（约 3 天）"
+          echo "可手动触发 checkin.yml 立即验证"
