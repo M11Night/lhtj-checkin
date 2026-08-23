@@ -1,0 +1,22 @@
+name: diag-captcha
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - name: 探查 801810 响应结构
+        env:
+          LHTJ_TOKEN: ${{ secrets.LHTJ_TOKEN }}
+          LHTJ_USERTOKEN: ${{ secrets.LHTJ_USERTOKEN }}
+          LHTJ_DXRISK_TOKEN: ${{ secrets.LHTJ_DXRISK_TOKEN }}
+          LHTJ_COOKIE: ${{ secrets.LHTJ_COOKIE }}
+          LHTJ_CAPTCHA_TOKEN: ${{ secrets.LHTJ_CAPTCHA_TOKEN }}
+          LHTJ_ACTIVITY_NO: ${{ secrets.LHTJ_ACTIVITY_NO }}
+        run: python diag_captcha.py
