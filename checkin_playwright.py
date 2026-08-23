@@ -41,6 +41,18 @@ WECOM_WEBHOOK = os.getenv('WECOM_WEBHOOK', '').strip()
 GH_TOKEN = os.getenv('GH_TOKEN', '').strip() or os.getenv('GITHUB_TOKEN', '').strip()
 GITHUB_REPOSITORY = os.getenv('GITHUB_REPOSITORY', '').strip()
 
+# headless 控制：有 DISPLAY（xvfb-run 提供）时默认有头，否则回退 headless
+_headless_env = os.getenv('PW_HEADLESS', '').strip().lower()
+if _headless_env in ('1', 'true', 'yes'):
+    HEADLESS = True
+elif _headless_env in ('0', 'false', 'no'):
+    HEADLESS = False
+else:
+    HEADLESS = not bool(os.getenv('DISPLAY', ''))
+
+# 设备像素比：移动端模拟用 2。缺口识别在「截图像素」里做，需除以它换算成 CSS 像素
+DEVICE_SCALE_FACTOR = 2
+
 HOME_URL = 'https://longzhu.longfor.com/'
 # 签到页：token 通过 URL 参数 + sessionStorage 传递
 SIGNIN_URL = ('https://longzhu.longfor.com/#/signin?token={token}'
@@ -130,17 +142,65 @@ def get_growth_value(token):
 
 # ======================== 反检测注入 ========================
 STEALTH_JS = r"""
+// 抹掉 webdriver 标记
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN','zh','en']});
-window.chrome = window.chrome || {runtime: {}};
-const _q = window.navigator.permissions && window.navigator.permissions.query;
-if (_q) { window.navigator.permissions.query = (p) => p && p.name==='notifications'
-    ? Promise.resolve({state: Notification.permission}) : _q(p); }
+
+// ---- 自洽的 iPhone 指纹（与 UA_IPHONE / is_mobile / has_touch 保持一致，别自相矛盾）----
 Object.defineProperty(navigator, 'platform', {get: () => 'iPhone'});
-Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 4});
-Object.defineProperty(navigator, 'deviceMemory', {get: () => 4});
+Object.defineProperty(navigator, 'vendor', {get: () => 'Apple Computer, Inc.'});
+Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 6});
 Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 5});
+// iPhone Safari 不暴露 deviceMemory —— 别硬塞假值（塞 4 反而自相矛盾）
+try { Object.defineProperty(navigator, 'deviceMemory', {get: () => undefined}); } catch (e) {}
+
+// plugins 用空 PluginArray 语义（iPhone Safari 的 plugins.length 为 0），而非塞 [1,2,3,4,5]
+try {
+    Object.defineProperty(navigator, 'plugins', {get: () => ({
+        length: 0, item: () => null, namedItem: () => null, refresh: () => {}
+    })});
+} catch (e) {}
+
+// 移除无头 Chromium 的 chrome 特征对象（iPhone Safari 没有 window.chrome）
+try { delete window.chrome; } catch (e) {}
+try { Object.defineProperty(window, 'chrome', {get: () => undefined}); } catch (e) {}
+
+// 语言
+Object.defineProperty(navigator, 'language', {get: () => 'zh-CN'});
+Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
+
+// permissions.query 劫持（通知权限返回真实状态，避免返回被检测的 pending）
+const _q = window.navigator.permissions && window.navigator.permissions.query;
+if (_q) {
+    window.navigator.permissions.query = (p) => p && p.name === 'notifications'
+        ? Promise.resolve({state: Notification.permission})
+        : _q(p);
+}
+
+// iframe contentWindow 特征抹平
+try {
+    Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+        get: function() { return window; }
+    });
+} catch (e) {}
+
+// canvas 指纹轻量扰动（固定 seed，会话内稳定，避开无头默认值）
+(() => {
+    const seed = 0x5A5A5A5A;
+    const orig = HTMLCanvasElement.prototype.toDataURL;
+    HTMLCanvasElement.prototype.toDataURL = function(...a) {
+        try {
+            const c = this.getContext('2d');
+            if (c) {
+                const d = c.getImageData(0, 0, Math.min(this.width, 32), Math.min(this.height, 32));
+                for (let i = 0; i < d.data.length; i += 4) {
+                    d.data[i] = (d.data[i] + ((seed >> (i % 24)) & 3)) & 255;
+                }
+                c.putImageData(d, 0, 0);
+            }
+        } catch (e) {}
+        return orig.apply(this, a);
+    };
+})();
 """
 
 
@@ -162,10 +222,12 @@ def build_cookies(cookie_str):
 # ======================== 滑块求解（OpenCV）========================
 def find_gap_x(screenshot_bytes):
     """
-    对滑块验证码截图做边缘检测，返回缺口横坐标（像素）。
-    顶象滑块：左侧是拼图块，背景某处有缺口（边缘锐利）。
-    策略：高斯模糊降噪 → Canny 边缘 → 按列统计 → 统计阈值(中位数+k*标准差)
-          定位边缘异常密集的列，即为缺口左边界。跳过最左侧拼图块区域。
+    对滑块背景截图识别缺口，返回缺口左边界横坐标（截图像素）。
+    顶象滑块：背景是真实照片，缺口是带阴影边框的「洞」。
+    相对旧版（整图按列求和 + 找第一个超阈值列）的三处改进：
+      1. 只取图像中部 y 带，排除上下 UI/logo 的竖边干扰
+      2. 取「峰值列」而非「第一个超阈值列」，避开背景纹理误报
+      3. 峰值必须显著高于基线，否则返回 None（交给上层刷新重试），绝不瞎给坐标
     """
     if not HAS_CV2:
         return None
@@ -175,82 +237,112 @@ def find_gap_x(screenshot_bytes):
         return None
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # 高斯模糊降噪，抑制纹理噪点（真实照片背景更平滑）
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(gray, 80, 200)
-    # 按列统计边缘像素数
-    col_sum = edges.sum(axis=0).astype(np.float64)
+    # 只统计中部 y 带，减少上下文字/logo 的竖边干扰
+    y0, y1 = int(h * 0.20), int(h * 0.80)
+    band = edges[y0:y1, :]
+    col_sum = band.sum(axis=0).astype(np.float64)
     # 平滑
     kernel = 5
-    smooth = np.convolve(col_sum, np.ones(kernel)/kernel, mode='same')
-    # 跳过最左侧 15%（拼图块起始区，边缘多会干扰）
-    start = int(w * 0.15)
+    smooth = np.convolve(col_sum, np.ones(kernel) / kernel, mode='same')
+    # 跳过最左 20%（拼图块及其阴影区，边缘密集会干扰）
+    start = int(w * 0.20)
     tail = smooth[start:]
     if len(tail) == 0:
         return None
-    # 统计阈值：缺口列的边缘数远高于背景基线
+    peak = int(np.argmax(tail))
+    peak_val = float(tail[peak])
     med = float(np.median(tail))
     std = float(np.std(tail))
-    threshold = med + max(2.2 * std, 18.0)  # 至少 18，避免全平滑时阈值过低
-    peak_val = float(tail.max())
-    # 若最大峰都不达阈值，退化为 max*0.5
-    if peak_val < threshold:
-        threshold = peak_val * 0.5
-    # 找 start 之后第一个超过阈值的列（缺口左边界）
-    gap_x = None
-    for x in range(start, w):
-        if smooth[x] >= threshold:
-            gap_x = x
-            break
-    if gap_x is None:
+    # 峰值必须显著：超过 中位数+3σ 且绝对强度足够，否则视为没找到
+    if peak_val < med + max(3.0 * std, 25.0):
         return None
-    # 微调：向左回退到边缘上升起点（找到峰的左脚）
-    while gap_x > start and smooth[gap_x-1] < smooth[gap_x] and smooth[gap_x-1] > med:
+    gap_x = start + peak
+    # 向左回退到峰的左脚（上升沿起点），更接近缺口真实左边界
+    while gap_x > start and smooth[gap_x - 1] > med:
         gap_x -= 1
     return gap_x
 
 
 def human_drag(page, locator, distance):
     """
-    拟人化拖动滑块：三段式变速（加速→匀速→减速）+ 随机抖动 + 过冲回调。
-    distance: 需要移动的横向像素数。
+    拟人化拖动滑块：三段式变速（慢起步加速→匀速→减速）+ 过冲回调 + 连续事件流。
+    distance: 需要移动的横向 CSS 像素数。
     """
+    if distance <= 0:
+        return False
     box = locator.bounding_box()
     if not box:
         return False
     start_x = box['x'] + box['width'] / 2
     start_y = box['y'] + box['height'] / 2
 
-    # 生成轨迹点
-    steps = random.randint(28, 38)
-    points = []
-    # 过冲量
-    overshoot = random.randint(4, 9)
+    overshoot = random.uniform(3, 6)
     target = distance + overshoot
-    cur = 0.0
-    for i in range(1, steps + 1):
+    steps = random.randint(80, 120)          # 事件点翻倍，接近真人事件流密度
+    pts = []
+    for i in range(steps):
         t = i / steps
-        # ease-out 加速曲线
-        progress = 1 - (1 - t) ** 3
-        cur = target * progress
-        jitter = random.uniform(-1.2, 1.2)
-        points.append((cur + jitter, random.uniform(-1.5, 1.5)))
-    # 过冲回调到真实 distance
-    back_steps = random.randint(4, 7)
-    for i in range(1, back_steps + 1):
-        t = i / back_steps
-        cur = target - overshoot * t
-        points.append((cur + random.uniform(-0.8, 0.8), random.uniform(-1, 1)))
+        # 三段式：慢起步（加速段）→ 匀速段 → 减速段
+        if t < 0.25:
+            p = (t / 0.25) ** 2 * 0.25        # 起点速度≈0，避免一步跳 10%
+        elif t < 0.75:
+            p = 0.25 + (t - 0.25) / 0.5 * 0.6
+        else:
+            p = 0.85 + (1 - (1 - (t - 0.75) / 0.25) ** 2) * 0.15
+        pts.append((target * p + random.uniform(-0.5, 0.5),
+                    random.uniform(-1.0, 1.0)))
+    # 过冲回拉到真实目标（t 归一化 0→1，确保最终停在 distance）
+    back_steps = random.randint(6, 10)
+    for i in range(back_steps):
+        t = i / max(back_steps - 1, 1)
+        x = target - overshoot * t
+        pts.append((x + random.uniform(-0.4, 0.4), random.uniform(-0.6, 0.6)))
 
     page.mouse.move(start_x, start_y)
     page.mouse.down()
-    time.sleep(random.uniform(0.15, 0.35))
-    for px, py in points:
-        page.mouse.move(start_x + px, start_y + py)
-        time.sleep(random.uniform(0.008, 0.022))
-    time.sleep(random.uniform(0.1, 0.25))
+    time.sleep(random.uniform(0.10, 0.20))
+    for px, py in pts:
+        # steps= 让 Playwright 派发连续 mousemove 事件，而不是单点瞬移
+        page.mouse.move(start_x + px, start_y + py, steps=random.randint(2, 4))
+        time.sleep(random.uniform(0.004, 0.016))
+    time.sleep(random.uniform(0.15, 0.30))
     page.mouse.up()
     return True
+
+
+# 顶象拼图块常见选择器（如与你的版本 DOM 不符，用 DevTools 确认后调整即可）
+PIECE_SELECTORS = [
+    '.dx_captcha_loading_basic_pic-slide',
+    '.dx_captcha_loading_basic_slider-icon',
+    '[class*="dx_captcha_loading_basic_pic"] canvas',
+    '[class*="jigsaw"]',
+    '[class*="slider-icon"]',
+    '[class*="slide-piece"]',
+    '[class*="slide_piece"]',
+]
+
+
+def _locate_piece(page):
+    """尽力定位拼图块元素；找不到返回 None（此时按 piece_left=0 处理）。"""
+    for sel in PIECE_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                return loc
+        except Exception:
+            continue
+    return None
+
+
+def _refresh_captcha(page):
+    """点刷新按钮换一张图，避免同一张图反复误判。"""
+    try:
+        page.locator('.dx_captcha_loading_refresh, .dx_captcha_loading_img_btn_refresh').first.click(timeout=2000)
+        time.sleep(1.2)
+    except Exception:
+        pass
 
 
 def solve_slider(page, attempt):
@@ -268,11 +360,38 @@ def solve_slider(page, attempt):
 
     # 截图滑块图区域
     shot = pic.screenshot()
-    gap_x = find_gap_x(shot)
-    if gap_x is None:
-        log(f"  第{attempt}次: OpenCV 未识别到缺口")
+    gap_x_img = find_gap_x(shot)
+    if gap_x_img is None:
+        log(f"  第{attempt}次: OpenCV 未识别到缺口（低置信度），刷新重试")
+        _refresh_captcha(page)
         return False
-    log(f"  第{attempt}次: 识别缺口横坐标≈{gap_x}px")
+
+    # 截图像素 → CSS 像素换算（截图按 deviceScaleFactor 放大）
+    try:
+        dpr = float(page.evaluate('window.devicePixelRatio')) or 1.0
+    except Exception:
+        dpr = 1.0
+    gap_css = gap_x_img / dpr
+
+    # 距离校准：缺口横坐标(相对截图左边界) - 拼图块初始左边界(相对截图左边界)
+    try:
+        pic_box = pic.bounding_box()
+    except Exception:
+        pic_box = None
+    piece = _locate_piece(page)
+    piece_left = 0.0
+    if piece is not None and pic_box is not None:
+        try:
+            piece_box = piece.bounding_box()
+            piece_left = piece_box['x'] - pic_box['x']
+        except Exception:
+            piece_left = 0.0
+    distance = gap_css - piece_left
+    if distance <= 0:
+        log(f"  第{attempt}次: 计算的拖拽距离异常({distance:.1f}px)，刷新重试")
+        _refresh_captcha(page)
+        return False
+    log(f"  第{attempt}次: 缺口≈{gap_x_img}px(截图) → 拖拽距离≈{distance:.1f}px(CSS)")
 
     # 找滑块拖动按钮（顶象 slider 按钮）
     handle = None
@@ -289,7 +408,7 @@ def solve_slider(page, attempt):
         log(f"  第{attempt}次: 未找到滑块按钮")
         return False
 
-    ok = human_drag(page, handle, gap_x)
+    ok = human_drag(page, handle, distance)
     if not ok:
         return False
     time.sleep(2.0)
@@ -303,12 +422,7 @@ def solve_slider(page, attempt):
         return True
     except Exception:
         log(f"  第{attempt}次滑块未通过，准备重试")
-        # 点刷新换图
-        try:
-            page.locator('.dx_captcha_loading_refresh, .dx_captcha_loading_img_btn_refresh').first.click(timeout=2000)
-            time.sleep(1.2)
-        except Exception:
-            pass
+        _refresh_captcha(page)
         return False
 
 
@@ -328,17 +442,26 @@ def run():
 
     result = 'failed'
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=[
+        if HEADLESS:
+            log("⚠️ 无 DISPLAY，回退 headless（建议用 xvfb-run -a 启动以获得有头模式）")
+        else:
+            log("🖥️  有头模式（headful）运行，设备指纹更真实")
+        browser = p.chromium.launch(headless=HEADLESS, args=[
             '--no-sandbox', '--disable-setuid-sandbox',
             '--disable-blink-features=AutomationControlled',
             '--disable-dev-shm-usage',
+            '--disable-gpu',           # CI 无 GPU，用软件渲染避免崩溃
+            '--hide-scrollbars',
         ])
         context = browser.new_context(
             user_agent=UA_IPHONE,
             viewport={'width': 375, 'height': 812},
+            screen={'width': 375, 'height': 812},
             is_mobile=True,
             has_touch=True,
             locale='zh-CN',
+            timezone_id='Asia/Shanghai',
+            device_scale_factor=DEVICE_SCALE_FACTOR,
         )
         context.add_init_script(STEALTH_JS)
         # 注入 cookie
