@@ -56,7 +56,7 @@ DEVICE_SCALE_FACTOR = 2
 HOME_URL = 'https://longzhu.longfor.com/'
 # 签到页：token 通过 URL 参数 + sessionStorage 传递
 SIGNIN_URL = ('https://longzhu.longfor.com/#/signin?token={token}'
-              '&buCode=C20400&channel=C2&cityCode=440300&task_id=null'
+              '&buCode=C20400&channel=C2&cityCode=440300'
               '&navFontColor=323232&navBgColor=f7dda9&title=%E6%89%93%E5%8D%A1%E7%AD%BE%E5%88%B0&navTitle=')
 
 # 成长值查询（与 API 方案一致，用于验证签到到账）
@@ -649,6 +649,16 @@ def do_signin(page):
         page.goto(SIGNIN_URL.format(token=h5_token), wait_until='networkidle', timeout=30000)
         time.sleep(2)
         page.screenshot(path='/tmp/pw_signin_page.png', full_page=True)
+
+        # 关闭可能出现的「参数错误」等弹窗（有「知道了」按钮）
+        try:
+            know = page.locator('text=知道了').first
+            if know.count() > 0 and know.is_visible():
+                know.click(timeout=2000)
+                log("→ 关闭了「知道了」弹窗")
+                time.sleep(0.5)
+        except Exception:
+            pass
 
         body_text = page.inner_text('body')
         # 检测登录态
