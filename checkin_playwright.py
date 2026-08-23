@@ -568,6 +568,61 @@ def run():
     return result
 
 
+def _trigger_sign(page):
+    """触发签到按钮，返回是否成功触发。附带打印页面可点击元素用于定位。"""
+    # 调试：探测页面上的按钮/可点击元素
+    try:
+        els = page.evaluate('''() => {
+            const out = [];
+            document.querySelectorAll('button, [class*="sign"], [class*="btn"], [class*="button"], [class*="checkin"]').forEach((e, i) => {
+                if (i > 40) return;
+                const r = e.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) return;
+                out.push({tag: e.tagName, cls: (typeof e.className === 'string' ? e.className : '').slice(0, 60), txt: (e.innerText || '').trim().slice(0, 24)});
+            });
+            return out;
+        }''')
+        log(f"🔍 页面可点击元素: {els}")
+    except Exception as e:
+        log(f"⚠️ 探测元素异常: {e}")
+    try:
+        log(f"🔍 页面文本(前300字): {page.inner_text('body')[:300]}")
+    except Exception:
+        pass
+
+    # 按优先级找按钮
+    for sel in ['text=立即签到', 'text=签到', 'text=打卡', '.sign-now',
+                '[class*="sign-now"]', 'button:has-text("签到")',
+                'button:has-text("打卡")', '[class*="sign"]']:
+        try:
+            btn = page.locator(sel).first
+            if btn.count() > 0 and btn.is_visible():
+                btn.click(timeout=5000)
+                log(f"  ✅ 点击成功: {sel}")
+                return True
+        except Exception:
+            continue
+    # 兜底：JS 触发
+    try:
+        r = page.evaluate('''() => {
+            const els = document.querySelectorAll('*');
+            for (const el of els) {
+                const c = typeof el.className === 'string' ? el.className : '';
+                const t = (el.innerText || '').trim();
+                if (c.includes('sign') || t === '立即签到' || t === '签到' || t === '打卡') {
+                    el.click(); return {cls: c.slice(0, 40), txt: t.slice(0, 20)};
+                }
+            }
+            return null;
+        }''')
+        if r:
+            log(f"  ✅ JS 触发: {r}")
+            return True
+    except Exception as e:
+        log(f"⚠️ JS 触发异常: {e}")
+    return False
+
+
 def do_signin(page):
     """核心签到流程。返回 'new'/'already'/'token_only'/'failed'"""
     # H5 认证：x-lf-usertoken 头 ← sessionStorage "token"。
@@ -621,33 +676,7 @@ def do_signin(page):
 
     # 3. 点击「立即签到」
     log("→ 点击「立即签到」...")
-    clicked = False
-    for sel in ['.sign-now', 'text=立即签到', 'text=签到', '[class*="sign-now"]']:
-        try:
-            btn = page.locator(sel).first
-            if btn.count() > 0 and btn.is_visible():
-                btn.click(timeout=5000)
-                clicked = True
-                log(f"  点击成功: {sel}")
-                break
-        except Exception:
-            continue
-    if not clicked:
-        log("⚠️ 未找到签到按钮，尝试直接调用 sign()")
-        # 兜底：尝试 JS 触发 Vue 组件的 handleSign
-        try:
-            page.evaluate('''() => {
-                const els = document.querySelectorAll('*');
-                for (const el of els) {
-                    if (el.className && typeof el.className === 'string' && el.className.includes('sign-now')) {
-                        el.click(); return true;
-                    }
-                }
-                return false;
-            }''')
-            clicked = True
-        except Exception:
-            pass
+    clicked = _trigger_sign(page)
 
     time.sleep(2)
     page.screenshot(path='/tmp/pw_after_click.png', full_page=True)
@@ -692,6 +721,14 @@ def do_signin(page):
                 if captured_signin_result is not None:
                     break
                 time.sleep(0.5)
+            if captured_signin_result is None:
+                # 前端没有自动重发 → 手动再点一次签到触发重发
+                log("→ 前端未自动重发，手动重新触发签到...")
+                _trigger_sign(page)
+                for _ in range(24):
+                    if captured_signin_result is not None:
+                        break
+                    time.sleep(0.5)
             if captured_signin_result is not None:
                 code = captured_signin_result.get('code')
                 is_popup = (captured_signin_result.get('data') or {}).get('is_popup', 0)
