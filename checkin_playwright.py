@@ -480,6 +480,11 @@ def run():
 
         def on_request(req):
             global captured_captcha_token, captured_dxrisk_token
+            try:
+                if req.resource_type in ('xhr', 'fetch'):
+                    log(f"🌐 REQ {req.method} {req.url[:130]}")
+            except Exception:
+                pass
             if _is_clock(req.url):
                 h = req.headers
                 ct = h.get('x-lf-dxrisk-captcha-token', '')
@@ -493,6 +498,11 @@ def run():
 
         def on_response(resp):
             global captured_signin_result, captured_captcha_token, captured_dxrisk_token
+            try:
+                if resp.request.resource_type in ('xhr', 'fetch'):
+                    log(f"🌐 RESP [{resp.status}] {resp.request.method} {resp.url[:130]}")
+            except Exception:
+                pass
             if not _is_clock(resp.url):
                 return
             # 从响应关联的请求里补抓 token（重发请求里的 token 也在这里兜底）
