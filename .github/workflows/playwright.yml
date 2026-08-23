@@ -52,7 +52,9 @@ jobs:
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
           GH_TOKEN: ${{ secrets.GH_PAT }}          # 写回 Secret 需要具有 repo 权限的 PAT
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python checkin_playwright.py
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb >/dev/null
+          xvfb-run -a -s "-screen 0 1280x1024x24" python checkin_playwright.py
 
       - name: 上传调试截图
         if: always()
