@@ -69,6 +69,7 @@ UA_IPHONE = ('Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) '
 notify_msg = []
 captured_captcha_token = None  # 从网络请求中捕获的新 captcha-token
 captured_dxrisk_token = None   # 新的 dxrisk-token（若有）
+captured_signin_result = None  # 签到接口响应体（用于可靠判定结果）
 
 
 # ======================== 日志 / 推送 ========================
@@ -473,20 +474,47 @@ def run():
 
         page = context.new_page()
 
-        # ---- 网络拦截：捕获 captcha-token ----
+        # ---- 网络拦截：捕获 captcha-token 与签到结果 ----
+        def _is_clock(url):
+            return 'signature/clock' in url or ('/task/v1/' in url and 'clock' in url)
+
         def on_request(req):
             global captured_captcha_token, captured_dxrisk_token
-            url = req.url
-            if 'signature/clock' in url or ('/task/v1/' in url and 'clock' in url):
+            if _is_clock(req.url):
                 h = req.headers
                 ct = h.get('x-lf-dxrisk-captcha-token', '')
                 dt = h.get('x-lf-dxrisk-token', '')
-                if ct:
+                if ct and ct.lower() not in ('undefined', 'null'):
                     captured_captcha_token = ct
-                    log(f"🔓 捕获到 captcha-token: {ct[:30]}...")
+                    log(f"🔓 捕获到 captcha-token: {ct[:40]}...")
                 if dt:
                     captured_dxrisk_token = dt
         page.on('request', on_request)
+
+        def on_response(resp):
+            global captured_signin_result, captured_captcha_token, captured_dxrisk_token
+            if not _is_clock(resp.url):
+                return
+            # 从响应关联的请求里补抓 token（重发请求里的 token 也在这里兜底）
+            try:
+                rh = resp.request.headers
+                ct = rh.get('x-lf-dxrisk-captcha-token', '')
+                dt = rh.get('x-lf-dxrisk-token', '')
+                if ct and ct.lower() not in ('undefined', 'null'):
+                    captured_captcha_token = ct
+                    log(f"🔓 从响应关联请求捕获 captcha-token: {ct[:40]}...")
+                if dt:
+                    captured_dxrisk_token = dt
+            except Exception:
+                pass
+            # 记录签到接口响应，用于可靠判定结果
+            try:
+                body = resp.json()
+                captured_signin_result = body
+                log(f"📨 签到接口响应: code={body.get('code')} msg={body.get('message','')}")
+            except Exception:
+                pass
+        page.on('response', on_response)
 
         try:
             result = do_signin(page)
@@ -503,7 +531,7 @@ def run():
 
     # ---- 写回新 token ----
     token_refreshed = False
-    if captured_captcha_token and result in ('new', 'token_only'):
+    if captured_captcha_token:
         token_refreshed = write_secret('LHTJ_CAPTCHA_TOKEN', captured_captcha_token)
         if captured_dxrisk_token and captured_dxrisk_token != LHTJ_DXRISK_TOKEN:
             write_secret('LHTJ_DXRISK_TOKEN', captured_dxrisk_token)
@@ -658,18 +686,24 @@ def do_signin(page):
     if captcha_appeared:
         handled = handle_captcha(page)
         if handled:
-            time.sleep(2)
-            bt = page.inner_text('body')
-            if '签到成功' in bt or 'signing finish' in page.content() or 'signin-done' in page.content():
-                signin_done = True
-                log("✅ 验证码通过，签到成功")
-            else:
-                # 验证码过了但签到状态未明确 → 至少 token 已刷新
-                if captured_captcha_token:
-                    log("🔓 验证码已过，captcha-token 已捕获（签到结果待确认）")
-                    return 'token_only'
+            log("→ 验证码已过，等待签到接口重发结果...")
+            # 无感放行/滑块通过后前端会重发 signature/clock，轮询等结果（最多 12 秒）
+            for _ in range(24):
+                if captured_signin_result is not None:
+                    break
+                time.sleep(0.5)
+            if captured_signin_result is not None:
+                code = captured_signin_result.get('code')
+                is_popup = (captured_signin_result.get('data') or {}).get('is_popup', 0)
+                if code == '0000' and is_popup == 1:
+                    signin_done = True
+                    log("✅ 验证码通过，签到成功")
+                elif code == '0000':
+                    log("ℹ️ 验证码通过，但今日已签到")
                 else:
-                    log("⚠️ 验证码通过但未捕获到 token 且签到未确认")
+                    log(f"⚠️ 签到接口返回 code={code} msg={captured_signin_result.get('message','')}")
+            else:
+                log("⚠️ 验证码过了，但未捕获到签到接口响应")
         else:
             log("⛔️ 验证码未通过")
             page.screenshot(path='/tmp/pw_captcha_fail.png', full_page=True)
@@ -677,6 +711,12 @@ def do_signin(page):
     # 6. 最终判定
     if signin_done:
         return 'new'
+    if captured_signin_result is not None:
+        code = captured_signin_result.get('code')
+        is_popup = (captured_signin_result.get('data') or {}).get('is_popup', 0)
+        if code == '0000' and is_popup == 0:
+            log("ℹ️ 签到接口确认：今日已签到")
+            return 'already'
     # 即使签到没确认，但只要捕获到新 token 也算部分成功
     if captured_captcha_token:
         log("🔓 签到结果未确认，但已捕获新 captcha-token")
